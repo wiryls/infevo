@@ -1,0 +1,13 @@
+__pycache__
+.env
+.ruff_cache
+.venv
+*.pyc
+*.tmp
+session.toml
+.python-version
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
