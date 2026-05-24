@@ -21,7 +21,9 @@ def _tool_terminal_output() -> tuple[str, str]:
     try:
         result = subprocess.run(
             ["zellij", "action", "dump-screen"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode != 0:
             return "", result.stderr.strip()
@@ -38,7 +40,9 @@ def _tool_terminal_input(sequence: str, *, timeout=10) -> str:
     try:
         result = subprocess.run(
             ["zellij", "action", "write-chars", "--", sequence],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
         return "ok" if result.returncode == 0 else f"terminal error: {result.stderr.strip()}"
     except FileNotFoundError:
@@ -50,10 +54,14 @@ def _tool_terminal_input(sequence: str, *, timeout=10) -> str:
 
 
 DEFAULT_SELF = Path(__file__).parent / "SELF.md"
-DEFAULT_SYSTEM = DEFAULT_SELF.read_text() if DEFAULT_SELF.exists() else (
-    "You are controlling the terminal via input, "
-    "and each round of input is the terminal screen. "
-    "The current terminal content:"
+DEFAULT_SYSTEM = (
+    DEFAULT_SELF.read_text()
+    if DEFAULT_SELF.exists()
+    else (
+        "You are controlling the terminal via input, "
+        "and each round of input is the terminal screen. "
+        "The current terminal content:"
+    )
 )
 TOOLSET: dict[str, Callable[..., str]] = {"input": _tool_terminal_input}
 TOOLS: list[ChatCompletionToolParam] = [
@@ -293,7 +301,8 @@ terminal-screen:
 
 
 def main() -> None:
-    load_dotenv()
+    if not load_dotenv():
+        load_dotenv(Path(__file__).parent / ".env")
 
     history = os.getenv("SESSION", "session.toml")
     history = Path(__file__).with_name(history)

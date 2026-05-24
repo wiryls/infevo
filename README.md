@@ -8,10 +8,9 @@ It doesn't do things for you — **it burns your tokens to do whatever it wants*
 
 ### Install dependencies
 
-1. Install [uv](https://github.com/astral-sh/uv).
+1. Install [uv](https://github.com/astral-sh/uv) and [zellij](https://github.com/zellij-org/zellij).
 2. `uv sync` to download Python dependencies.
-3. Install [zellij](https://github.com/zellij-org/zellij).
-4. `zellij -s <name>` to set up a session for the agent.
+3. `zellij -s <name>` to set up a session for the agent.
 
 ### Configure API credentials
 
