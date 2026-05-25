@@ -4,103 +4,154 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, Self, cast
+from typing import ClassVar, Iterable, Self, cast
 
 import rtoml
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from openai.lib.streaming.chat import ChunkEvent, ContentDeltaEvent
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field, TypeAdapter
 
 
-def _tool_terminal_output() -> tuple[str, str]:
-    # currently not used as a tool but as input.
-    try:
-        result = subprocess.run(
-            ["zellij", "action", "dump-screen"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return "", result.stderr.strip()
-        return result.stdout.strip(), ""
-    except FileNotFoundError:
-        return "", "zellij not found"
-    except subprocess.TimeoutExpired:
-        return "", "zellij timeout"
-    except Exception as e:
-        return "", f"zellij error: {e}"
+@dataclass
+class Ok[T]:
+    value: T
 
 
-def _tool_terminal_input(sequence: str, *, timeout=10) -> str:
-    try:
-        result = subprocess.run(
-            ["zellij", "action", "write-chars", "--", sequence],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return "ok" if result.returncode == 0 else f"terminal error: {result.stderr.strip()}"
-    except FileNotFoundError:
-        return "terminal not found, current tool is broken"
-    except subprocess.TimeoutExpired:
-        return "terminal timeout"
-    except Exception as e:
-        return f"terminal exception: {e}"
+@dataclass
+class Error:
+    value: str
 
 
-DEFAULT_SELF = Path(__file__).parent / "SELF.md"
-DEFAULT_SYSTEM = (
-    DEFAULT_SELF.read_text()
-    if DEFAULT_SELF.exists()
-    else (
-        "You are controlling the terminal via input, "
-        "and each round of input is the terminal screen. "
-        "The current terminal content:"
-    )
-)
-TOOLSET: dict[str, Callable[..., str]] = {"input": _tool_terminal_input}
-TOOLS: list[ChatCompletionToolParam] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "input",
-            "description": (
-                "Write characters into the terminal. Ordinary characters type "
-                "literally; \\n = Enter, \\x03 = Ctrl+C, \\t = Tab. "
-                "Without \\n, a shell command is only typed, not run.\n\n"
-                "Examples:\n"
-                "  Shell: 'ls\\n'     runs command (Enter)\n"
-                "  Vim:   'dd'       deletes a line\n"
-                "  Vim:   '/foo\\n'   searches (Enter confirms)\n\n"
-                "Control keys: "
-                "\\n (Enter) | "
-                "\\x03 (Ctrl+C) | "
-                "\\x04 (Ctrl+D) | "
-                "\\x0c (Ctrl+L) | "
-                "\\x15 (Ctrl+U) | "
-                "\\x18 (Ctrl+X) | "
-                "\\t (Tab)"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sequence": {
-                        "type": "string",
-                        "description": (
-                            "Characters to write. Use \\n for Enter, \\xNN for Ctrl+key, \\t for Tab."
-                        ),
+type Result[T] = Ok[T] | Error
+
+
+@dataclass
+class TerminalSnapshot:
+    size: tuple[int, int]
+    cursor: tuple[int, int]
+    screen: str
+
+
+@dataclass
+class ToolContext:
+    name: str | None = None
+    pane: int | None = None
+    timeout: int = 5
+
+    def _build_action(self, action: str, *args: str) -> list[str]:
+        has_pane = action in ["dump-screen", "write-chars", "paste"]
+        cmd = ["zellij"]
+        cmd += ["-s", self.name] if self.name else []
+        cmd += ["action", action]
+        cmd += ["-p", str(self.pane)] if self.pane and has_pane else []
+        cmd += args
+        return cmd
+
+    def _run_action(self, action: str, *args: str) -> Result[str]:
+        command = self._build_action(action, *args)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=self.timeout)
+        if result.returncode == 0:
+            return Ok(result.stdout.strip())
+        return Error(result.stderr.strip())
+
+    class _PaneInfo(BaseModel):
+        id: int
+        is_plugin: bool
+        is_focused: bool
+        pane_rows: int
+        pane_columns: int
+        cursor_coordinates_in_pane: tuple[int, int] | None
+
+    def snapshot(self) -> Result[TerminalSnapshot]:
+        def _match(i: ToolContext._PaneInfo) -> bool:
+            return not i.is_plugin and (i.is_focused if self.pane is None else i.id == self.pane)
+
+        try:
+            match self._run_action("list-panes", "-j"), self._run_action("dump-screen"):
+                case Ok(text), Ok(view):
+                    panes = TypeAdapter(list[ToolContext._PaneInfo]).validate_json(text)
+                    pane = next(p for p in panes if _match(p))
+                case Error(_) as error, _:
+                    return error
+                case _, Error(_) as error:
+                    return error
+        except FileNotFoundError:
+            return Error("zellij communication error")
+        except subprocess.TimeoutExpired:
+            return Error("zellij action timeout")
+        except StopIteration:
+            return Error(f"zellij pane {str(self.pane)} not found")
+        except Exception as e:
+            return Error(f"zellij error: {e}")
+
+        size = (pane.pane_rows, pane.pane_columns)
+        cursor = pane.cursor_coordinates_in_pane or (0, 0)
+        return Ok(TerminalSnapshot(size=size, cursor=(cursor[1], cursor[0]), screen=view))
+
+    def input(self, sequence: str, *, paste: bool = False) -> str:
+        try:
+            action = "paste" if paste else "write-chars"
+            match self._run_action(action, "--", sequence):
+                case Ok(_):
+                    return "ok"
+                case Error(error):
+                    return f"terminal error: {error}"
+        except FileNotFoundError:
+            return "terminal not found, current tool is broken"
+        except subprocess.TimeoutExpired:
+            return "terminal timeout"
+        except Exception as e:
+            return f"terminal exception: {e}"
+
+    def call(self, name: str, arguments: str) -> str:
+        fn = {"input": self.input}.get(name)
+        if not fn:
+            return f"unknown tool: {name}"
+        try:
+            return fn(**json.loads(arguments))
+        except Exception as e:
+            return str(e)
+
+    TOOLS: ClassVar[list[ChatCompletionToolParam]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "input",
+                "description": (
+                    "Write characters into the terminal. "
+                    "\\n = Enter, \\x03 = Ctrl+C, \\t = Tab — everything else types literally. "
+                    "Without \\n, a shell command is only typed, never executed.\n\n"
+                    "Set paste=true to send as a bracketed paste instead of typing each "
+                    "character — faster for code blocks and large text.\n\n"
+                    "Examples:\n"
+                    "  Shell:  'ls\\n'     types ls and runs it\n"
+                    "  Vim:    'dd'       deletes a line\n"
+                    "  Vim:    '/foo\\n'   searches (Enter confirms)\n\n"
+                    "Control keys: \\n (Enter) | \\x03 (Ctrl+C) | \\x04 (Ctrl+D) | "
+                    "\\x0c (Ctrl+L) | \\x15 (Ctrl+U) | \\x18 (Ctrl+X) | \\t (Tab) | ...\n\n"
+                    "Returns 'ok' on success, or an error message on failure."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sequence": {
+                            "type": "string",
+                            "description": "Characters to write. Support \\n for Enter, \\xNN for Ctrl+key, etc.",
+                        },
+                        "paste": {
+                            "type": "boolean",
+                            "description": "Send as a bracketed paste instead of typing character by character.",
+                        },
                     },
+                    "required": ["sequence"],
                 },
-                "required": ["sequence"],
             },
         },
-    },
-]
+    ]
 
 
 class ToolCallFunction(BaseModel):
@@ -130,8 +181,8 @@ class Session(BaseModel):
     context_tokens: int | None = None
 
     @classmethod
-    def default(cls) -> Self:
-        return cls(messages=[Message(role="system", content=DEFAULT_SYSTEM)])
+    def empty(cls, prompt: str) -> Self:
+        return cls(messages=[Message(role="system", content=prompt)])
 
     @classmethod
     def load(cls, path: Path) -> Self:
@@ -211,23 +262,13 @@ def _flatten_json(raw: str) -> str:
     return raw
 
 
-def _call_tool(name: str, args: str) -> str:
-    fn = TOOLSET.get(name)
-    if not fn:
-        return f"unknown tool name {name}"
-    try:
-        return fn(**json.loads(args))
-    except Exception as e:
-        return str(e)
-
-
 def show(session: Session) -> None:
     for message in session.messages:
         _hr()
         print(Tagged.message(message))
 
 
-def chat(client: OpenAI, model: str, session: Session, content: str) -> None:
+def chat(client: OpenAI, model: str, session: Session, tool: ToolContext, content: str) -> None:
     messages = [Message(role="user", content=content)]
     while messages:
         _hr()
@@ -238,7 +279,7 @@ def chat(client: OpenAI, model: str, session: Session, content: str) -> None:
         with client.chat.completions.stream(
             messages=session.to_chat_completion_messages(),
             model=model,
-            tools=TOOLS,
+            tools=tool.TOOLS,
             stream_options={"include_usage": True},
         ) as stream:
             _hr()
@@ -284,47 +325,94 @@ def chat(client: OpenAI, model: str, session: Session, content: str) -> None:
             Message(
                 role="tool",
                 tool_call_id=t.id,
-                content=_call_tool(t.function.name, t.function.arguments),
+                content=tool.call(t.function.name, t.function.arguments),
             )
             for t in message.tool_calls or []
         ]
 
 
-def _build_user_message(session: Session, screen: str) -> str:
-    total = session.context_tokens
+def _build_user_message(session: Session, snap: TerminalSnapshot) -> str:
+    ctx = session.context_tokens
     return f"""\
 time: {datetime.now().isoformat()}
-context-tokens: {total if total is not None else "unknown"}
+context-tokens: {ctx if ctx is not None else "unknown"}
+terminal-size: {snap.size}
+terminal-cursor: {snap.cursor}
 terminal-screen:
-{screen}
+{snap.screen}
 """
 
 
+class Conf(BaseModel):
+    class Terminal(BaseModel):
+        pane_id: int | None = None
+        session_name: str | None = None
+        command_timeout: int = 10
+
+    class Provider(BaseModel):
+        url: str = "https://api.deepseek.com"
+        key: str = ""
+        model: str = "deepseek-v4-pro"
+
+    session: str = "session.toml"
+    provider: Provider = Field(default_factory=Provider)
+    terminal: Terminal = Field(default_factory=Terminal)
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "Conf":
+        if path is None:
+            name = "conf.toml"
+            for path in (Path(name), Path(__file__).with_name(name)):
+                if path.exists():
+                    break
+
+        if path:
+            text = rtoml.load(path) if path.exists() else {}
+            conf = cls.model_validate(text)
+        else:
+            conf = Conf()
+        conf.provider.key = os.getenv("OAI_API_KEY", conf.provider.key)
+        return conf
+
+
 def main() -> None:
-    if not load_dotenv():
-        load_dotenv(Path(__file__).parent / ".env")
+    config = Conf.load()
+    history = Path(__file__).with_name(config.session)
+    system = Path(__file__).with_name("SELF.md")
+    system_fallback = (
+        "You are controlling the terminal via `input`. "
+        "Each round of user message is the terminal screen. "
+        "Do whatever you want! \n"
+        "Now, this is the current terminal:"
+    )
+    prompt = system.read_text() if system.exists() else system_fallback
+    session = Session.load(history) if history.exists() else Session.empty(prompt)
 
-    history = os.getenv("SESSION", "session.toml")
-    history = Path(__file__).with_name(history)
-    session = Session.load(history) if history.exists() else Session.default()
+    # setup tools
+    tools = ToolContext(
+        name=config.terminal.session_name,
+        pane=config.terminal.pane_id,
+        timeout=config.terminal.command_timeout,
+    )
 
-    api_key = os.getenv("OAI_API_KEY", "")
-    api_url = os.getenv("OAI_API_URL", "https://api.deepseek.com")
-    client = OpenAI(api_key=api_key, base_url=api_url)
+    # setup client
+    client = OpenAI(api_key=config.provider.key, base_url=config.provider.url)
 
-    model = os.getenv("OAI_MODEL", "deepseek-v4-pro")
+    # start
+    model = config.provider.model
     match sys.argv[1:]:
         case [] | ["step"]:
-            match _tool_terminal_output():
-                case screen, "":
-                    content = _build_user_message(session, screen)
-                    chat(client, model, session, content)
+            match tools.snapshot():
+                case Ok(snap):
+                    content = _build_user_message(session, snap)
+                    chat(client, model, session, tools, content)
+                    _hr()
                     session.save(history)
-                case "", error:
+                    total_messages = len(session.messages)
+                    total_tokens = session.context_tokens
+                    print(f"[SAVED] {history} ({total_messages} messages, {total_tokens} tokens)")
+                case Error(error):
                     print(error)
-                    sys.exit(1)
-                case _:
-                    print("unexpected error")
                     sys.exit(1)
 
         case ["history"]:

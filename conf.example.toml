@@ -1,0 +1,11 @@
+session = "session.toml"
+
+[terminal]
+# pane_id = 0
+# session_name = "main"
+command_timeout = 10
+
+[provider]
+url = "https://api.deepseek.com"
+key = ""
+model = "deepseek-v4-pro"

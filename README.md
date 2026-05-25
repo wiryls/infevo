@@ -1,8 +1,8 @@
 # INF-EVO
 
-A terminal-native AI agent. No chat, no UI — just a shell, a screen, and a loop.
+An agent living in terminal. No chat, no UI, just a shell and a loop.
 
-It doesn't do things for you — **it burns your tokens to do whatever it wants**.
+It doesn't do things for you, **it burns your tokens to do whatever it wants**.
 
 ## Prerequisites
 
@@ -14,21 +14,14 @@ It doesn't do things for you — **it burns your tokens to do whatever it wants*
 
 ### Configure API credentials
 
-Copy the example and fill in your keys:
+Copy the example config and add your API key:
 
 ```bash
-cp .env.example .env
+cp conf.example.toml conf.toml
+# edit conf.toml → set [api] key = "sk-..."
 ```
 
-Setup `.env`:
-
-```env
-OAI_API_URL=https://api.deepseek.com
-OAI_API_KEY=sk-your-key-here
-OAI_MODEL=deepseek-v4-pro
-```
-
-Most OpenAI-compatible providers should work.
+Or set the `OAI_API_KEY` environment variable (takes priority over the config file).
 
 ## Usage
 
@@ -47,7 +40,7 @@ Each `step` appends to `session.toml`. The agent's identity is defined in `SELF.
 
 ### How it works
 
-```
+```ascii
 terminal screen → LLM (with SELF.md as system prompt) → characters → terminal
                        ↑                                               │
                        └──────────── session.toml ←────────────────────┘
