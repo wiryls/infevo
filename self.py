@@ -1,3 +1,4 @@
+import codecs
 import json
 import os
 import subprocess
@@ -41,7 +42,7 @@ class ToolContext:
     timeout: int = 5
 
     def _build_action(self, action: str, *args: str) -> list[str]:
-        has_pane = action in ["dump-screen", "write-chars", "paste"]
+        has_pane = action not in ["list-panes"]
         cmd = ["zellij"]
         cmd += ["-s", self.name] if self.name else []
         cmd += ["action", action]
@@ -90,14 +91,45 @@ class ToolContext:
         cursor = pane.cursor_coordinates_in_pane or (0, 0)
         return Ok(TerminalSnapshot(size=size, cursor=(cursor[1], cursor[0]), screen=view))
 
-    def input(self, sequence: str, *, paste: bool = False) -> str:
+    def input(self, sequence: str, *, paste: bool = False, unescape: bool = False) -> str:
         try:
             action = "paste" if paste else "write-chars"
+            sequence = codecs.decode(sequence, "unicode_escape") if unescape else sequence
             match self._run_action(action, "--", sequence):
                 case Ok(_):
-                    return "ok"
+                    return action
                 case Error(error):
                     return f"terminal error: {error}"
+        except FileNotFoundError:
+            return "terminal not found, current tool is broken"
+        except subprocess.TimeoutExpired:
+            return "terminal timeout"
+        except UnicodeDecodeError as e:
+            return f"terminal unescape error: {e}"
+        except Exception as e:
+            return f"terminal exception: {e}"
+
+    _SCROLL_ACTIONS: ClassVar[dict[tuple[str, bool], str]] = {
+        ("line", True): "scroll-up",
+        ("line", False): "scroll-down",
+        ("half-page", True): "half-page-scroll-up",
+        ("half-page", False): "half-page-scroll-down",
+        ("page", True): "page-scroll-up",
+        ("page", False): "page-scroll-down",
+        ("end", True): "scroll-to-top",
+        ("end", False): "scroll-to-bottom",
+    }
+
+    def scroll(self, unit: str, *, up: bool = True) -> str:
+        action = self._SCROLL_ACTIONS.get((unit, up))
+        if action is None:
+            return f"error: unknown scroll unit '{unit}'"
+        try:
+            match self._run_action(action):
+                case Ok(_):
+                    return action
+                case Error(error):
+                    return f"scroll error: {error}"
         except FileNotFoundError:
             return "terminal not found, current tool is broken"
         except subprocess.TimeoutExpired:
@@ -106,7 +138,7 @@ class ToolContext:
             return f"terminal exception: {e}"
 
     def call(self, name: str, arguments: str) -> str:
-        fn = {"input": self.input}.get(name)
+        fn = {"input": self.input, "scroll": self.scroll}.get(name)
         if not fn:
             return f"unknown tool: {name}"
         try:
@@ -114,24 +146,43 @@ class ToolContext:
         except Exception as e:
             return str(e)
 
+    _TOOL_INPUT_DESCRIPTION: ClassVar[str] = r"""Type characters into the terminal.
+
+Set paste=true for bracketed paste.
+
+Set unescape=true to interpret escapes for control keys:
+  \n  = Enter
+  \t  = Tab
+  \b  = Backspace
+  \f  = Ctrl+L
+  \\  = literal backslash
+
+Or JSON escapes:
+  \u001b    = ESC
+  \u0003    = Ctrl+C
+  \u0004    = Ctrl+D
+  \u0015    = Ctrl+U
+  \u0018    = Ctrl+X
+  \u001b[A  = Up       \u001b[B  = Down
+  \u001b[6~ = PgDn     \u001b[5~ = PgUp
+
+Examples (unescape=true):
+  git commit -m "msg"  # shell: type without executing
+  ls -la\n             # shell: type and run
+  ihello\u001b:wq\n    # vim: insert, ESC, save-quit
+  \u0003               # Ctrl+C to interrupt
+
+In shell, bash $'...' handles escapes natively:
+  printf $'\e[31mred\e[0m'\n
+
+Returns action name (write-chars, paste) or error message."""
+
     TOOLS: ClassVar[list[ChatCompletionToolParam]] = [
         {
             "type": "function",
             "function": {
                 "name": "input",
-                "description": (
-                    "Write characters into the terminal. "
-                    "\\n = Enter, \\x03 = Ctrl+C, \\t = Tab — everything else types literally. "
-                    "Without \\n, a shell command is only typed, never executed.\n\n"
-                    "Set paste=true to send as a bracketed paste instead of typing each "
-                    "character — faster for code blocks and large text.\n\n"
-                    "Examples:\n"
-                    "  Shell:  'ls\\n'     types ls and runs it\n"
-                    "  Vim:    '/foo\\n'   searches (Enter confirms)\n\n"
-                    "Control keys: \\n (Enter) | \\x03 (Ctrl+C) | \\x04 (Ctrl+D) | "
-                    "\\x0c (Ctrl+L) | \\x15 (Ctrl+U) | \\x18 (Ctrl+X) | \\t (Tab) | ...\n\n"
-                    "Returns 'ok' on success, or an error message on failure."
-                ),
+                "description": _TOOL_INPUT_DESCRIPTION,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -143,8 +194,34 @@ class ToolContext:
                             "type": "boolean",
                             "description": "Send as a bracketed paste instead of typing character by character.",
                         },
+                        "unescape": {
+                            "type": "boolean",
+                            "description": "Interpret escape sequences (e.g. \\u0003 -> Ctrl+C).",
+                        },
                     },
                     "required": ["sequence"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "scroll",
+                "description": "Scroll the terminal viewport to see more output. Does NOT send keys to the terminal program.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "unit": {
+                            "type": "string",
+                            "enum": ["line", "half-page", "page", "end"],
+                            "description": "Scroll unit: line, half-page, page, or end (up=true to top, up=false to bottom).",
+                        },
+                        "up": {
+                            "type": "boolean",
+                            "description": "True to scroll up (see earlier output), false to scroll down.",
+                        },
+                    },
+                    "required": ["unit"],
                 },
             },
         },
