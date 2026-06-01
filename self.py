@@ -1,5 +1,3 @@
-# uv run self.py [step | history]
-
 import json
 import os
 import subprocess
@@ -129,7 +127,6 @@ class ToolContext:
                     "character — faster for code blocks and large text.\n\n"
                     "Examples:\n"
                     "  Shell:  'ls\\n'     types ls and runs it\n"
-                    "  Vim:    'dd'       deletes a line\n"
                     "  Vim:    '/foo\\n'   searches (Enter confirms)\n\n"
                     "Control keys: \\n (Enter) | \\x03 (Ctrl+C) | \\x04 (Ctrl+D) | "
                     "\\x0c (Ctrl+L) | \\x15 (Ctrl+U) | \\x18 (Ctrl+X) | \\t (Tab) | ...\n\n"
@@ -140,7 +137,7 @@ class ToolContext:
                     "properties": {
                         "sequence": {
                             "type": "string",
-                            "description": "Characters to write. Support \\n for Enter, \\xNN for Ctrl+key, etc.",
+                            "description": "Characters to write.",
                         },
                         "paste": {
                             "type": "boolean",
@@ -401,7 +398,7 @@ def main() -> None:
     # start
     model = config.provider.model
     match sys.argv[1:]:
-        case [] | ["step"]:
+        case []:
             match tools.snapshot():
                 case Ok(snap):
                     content = _build_user_message(session, snap)
@@ -419,7 +416,7 @@ def main() -> None:
             show(session)
 
         case _:
-            print("usage: self.py [step | history]")
+            print("usage: self.py [history]")
             sys.exit(1)
 
 
