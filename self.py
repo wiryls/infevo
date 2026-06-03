@@ -1,6 +1,5 @@
 import codecs
 import json
-import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -9,10 +8,18 @@ from pathlib import Path
 from typing import ClassVar, Iterable, Self, cast
 
 import rtoml
-from openai import OpenAI
+from openai import (
+    APIError,
+    APIConnectionError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from openai.lib.streaming.chat import ChunkEvent, ContentDeltaEvent
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 
 @dataclass
@@ -36,7 +43,7 @@ class TerminalSnapshot:
 
 
 @dataclass
-class ToolContext:
+class TerminalContext:
     name: str | None = None
     pane: int | None = None
     timeout: int = 5
@@ -66,13 +73,13 @@ class ToolContext:
         cursor_coordinates_in_pane: tuple[int, int] | None
 
     def snapshot(self) -> Result[TerminalSnapshot]:
-        def _match(i: ToolContext._PaneInfo) -> bool:
+        def _match(i: TerminalContext._PaneInfo) -> bool:
             return not i.is_plugin and (i.is_focused if self.pane is None else i.id == self.pane)
 
         try:
             match self._run_action("list-panes", "-j"), self._run_action("dump-screen"):
                 case Ok(text), Ok(view):
-                    panes = TypeAdapter(list[ToolContext._PaneInfo]).validate_json(text)
+                    panes = TypeAdapter(list[TerminalContext._PaneInfo]).validate_json(text)
                     pane = next(p for p in panes if _match(p))
                 case Error(_) as error, _:
                     return error
@@ -84,8 +91,8 @@ class ToolContext:
             return Error("zellij action timeout")
         except StopIteration:
             return Error(f"zellij pane {str(self.pane)} not found")
-        except Exception as e:
-            return Error(f"zellij error: {e}")
+        except ValidationError as e:
+            return Error(f"zellij response malformed: {e}")
 
         size = (pane.pane_rows, pane.pane_columns)
         cursor = pane.cursor_coordinates_in_pane or (0, 0)
@@ -97,7 +104,7 @@ class ToolContext:
             sequence = codecs.decode(sequence, "unicode_escape") if unescape else sequence
             match self._run_action(action, "--", sequence):
                 case Ok(_):
-                    return action
+                    return "sent"
                 case Error(error):
                     return f"terminal error: {error}"
         except FileNotFoundError:
@@ -106,8 +113,6 @@ class ToolContext:
             return "terminal timeout"
         except UnicodeDecodeError as e:
             return f"terminal unescape error: {e}"
-        except Exception as e:
-            return f"terminal exception: {e}"
 
     _SCROLL_ACTIONS: ClassVar[dict[tuple[str, bool], str]] = {
         ("line", True): "scroll-up",
@@ -120,22 +125,20 @@ class ToolContext:
         ("end", False): "scroll-to-bottom",
     }
 
-    def scroll(self, unit: str, *, up: bool = True) -> str:
-        action = self._SCROLL_ACTIONS.get((unit, up))
+    def scroll(self, method: str, *, up: bool = True) -> str:
+        action = self._SCROLL_ACTIONS.get((method, up))
         if action is None:
-            return f"error: unknown scroll unit '{unit}'"
+            return f"error: unknown method '{method}'"
         try:
             match self._run_action(action):
                 case Ok(_):
-                    return action
+                    return "sent"
                 case Error(error):
                     return f"scroll error: {error}"
         except FileNotFoundError:
             return "terminal not found, current tool is broken"
         except subprocess.TimeoutExpired:
             return "terminal timeout"
-        except Exception as e:
-            return f"terminal exception: {e}"
 
     def call(self, name: str, arguments: str) -> str:
         fn = {"input": self.input, "scroll": self.scroll}.get(name)
@@ -143,46 +146,47 @@ class ToolContext:
             return f"unknown tool: {name}"
         try:
             return fn(**json.loads(arguments))
-        except Exception as e:
-            return str(e)
-
-    _TOOL_INPUT_DESCRIPTION: ClassVar[str] = r"""Type characters into the terminal.
-
-Set paste=true for bracketed paste.
-
-Set unescape=true to interpret escapes for control keys:
-  \n  = Enter
-  \t  = Tab
-  \b  = Backspace
-  \f  = Ctrl+L
-  \\  = literal backslash
-
-Or JSON escapes:
-  \u001b    = ESC
-  \u0003    = Ctrl+C
-  \u0004    = Ctrl+D
-  \u0015    = Ctrl+U
-  \u0018    = Ctrl+X
-  \u001b[A  = Up       \u001b[B  = Down
-  \u001b[6~ = PgDn     \u001b[5~ = PgUp
-
-Examples (unescape=true):
-  git commit -m "msg"  # shell: type without executing
-  ls -la\n             # shell: type and run
-  ihello\u001b:wq\n    # vim: insert, ESC, save-quit
-  \u0003               # Ctrl+C to interrupt
-
-In shell, bash $'...' handles escapes natively:
-  printf $'\e[31mred\e[0m'\n
-
-Returns action name (write-chars, paste) or error message."""
+        except json.JSONDecodeError as e:
+            return f"tool call JSON malformed: {e}"
+        except TypeError as e:
+            return f"tool call argument mismatch: {e}"
 
     TOOLS: ClassVar[list[ChatCompletionToolParam]] = [
         {
             "type": "function",
             "function": {
                 "name": "input",
-                "description": _TOOL_INPUT_DESCRIPTION,
+                "description": r"""Type characters at the terminal cursor.
+
+Set paste=true for bracketed paste mode.
+
+Set unescape=true to interpret escapes sequences, e.g.:
+  \n  = Enter
+  \t  = Tab
+  \b  = Backspace
+  \f  = Ctrl+L
+  \\  = literal backslash
+
+Support JSON escapes, e.g.:
+  \u001b    = ESC
+  \u0003    = Ctrl+C
+  \u0004    = Ctrl+D
+  \u0018    = Ctrl+X
+  \u001b[A  = Up
+  \u001b[B  = Down
+  \u001b[5~ = PageUp
+  \u001b[6~ = PageDown
+
+Examples of unescape=true:
+  git commit -m "msg"  # shell: type without executing
+  ls -la\n             # shell: type and run
+  ihello\u001b:wq\n    # vim: insert, ESC, save-quit
+  \u0003               # Ctrl+C to interrupt
+
+In shell, bash $'...' handles escapes natively, e.g.:
+  printf $'\e[31mred\e[0m'\n
+
+This tool is asynchronous, returns 'sent' if command sent to terminal else error messages.""",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -207,21 +211,27 @@ Returns action name (write-chars, paste) or error message."""
             "type": "function",
             "function": {
                 "name": "scroll",
-                "description": "Scroll the terminal viewport to see more output. Does NOT send keys to the terminal program.",
+                "description": (
+                    "Scroll the terminal viewport to review historical output. "
+                    "It does NOT send keystrokes to the terminal program, only repositions your view.\n\n"
+                    "After scrolling, `input` will auto-scroll the viewport back to the cursor; "
+                    "you do NOT need to manually scroll back before typing.\n\n"
+                    "This tool is asynchronous, returns 'sent' if sent to terminal else error messages."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "unit": {
+                        "method": {
                             "type": "string",
                             "enum": ["line", "half-page", "page", "end"],
-                            "description": "Scroll unit: line, half-page, page, or end (up=true to top, up=false to bottom).",
+                            "description": "Scroll method: line, half-page, page, or end (up=true to top; false to bottom).",
                         },
                         "up": {
                             "type": "boolean",
                             "description": "True to scroll up (see earlier output), false to scroll down.",
                         },
                     },
-                    "required": ["unit"],
+                    "required": ["method"],
                 },
             },
         },
@@ -253,6 +263,7 @@ class Message(BaseModel):
 class Session(BaseModel):
     messages: list[Message] = Field(default_factory=list)
     context_tokens: int | None = None
+    rounds: int = 0
 
     @classmethod
     def empty(cls, prompt: str) -> Self:
@@ -342,7 +353,8 @@ def show(session: Session) -> None:
         print(Tagged.message(message))
 
 
-def chat(client: OpenAI, model: str, session: Session, tool: ToolContext, content: str) -> None:
+def chat(client: OpenAI, model: str, session: Session, tool: TerminalContext, content: str) -> None:
+    session.rounds += 1
     messages = [Message(role="user", content=content)]
     while messages:
         _hr()
@@ -405,16 +417,16 @@ def chat(client: OpenAI, model: str, session: Session, tool: ToolContext, conten
         ]
 
 
-def _build_user_message(session: Session, snap: TerminalSnapshot) -> str:
-    ctx = session.context_tokens
-    return f"""\
-time: {datetime.now().isoformat()}
-context-tokens: {ctx if ctx is not None else "unknown"}
-terminal-size: {snap.size}
-terminal-cursor: {snap.cursor}
-terminal-screen:
-{snap.screen}
-"""
+def save_sessions(session: Session, filepath: Path) -> None:
+    _hr()
+    try:
+        session.save(filepath)
+    except (OSError, TypeError, ValueError) as e:
+        print(f"[SESSION] {e}")
+    else:
+        total_messages = len(session.messages)
+        total_tokens = session.context_tokens
+        print(f"[SESSION] {filepath} ({total_messages} messages, {total_tokens} tokens)")
 
 
 class Conf(BaseModel):
@@ -427,6 +439,7 @@ class Conf(BaseModel):
         url: str = "https://api.deepseek.com"
         key: str = ""
         model: str = "deepseek-v4-pro"
+        context_limit: int | None = None
 
     session: str = "session.toml"
     provider: Provider = Field(default_factory=Provider)
@@ -436,17 +449,29 @@ class Conf(BaseModel):
     def load(cls, path: Path | None = None) -> "Conf":
         if path is None:
             name = "conf.toml"
-            for path in (Path(name), Path(__file__).with_name(name)):
-                if path.exists():
-                    break
+            plan = (Path(name), Path(__file__).with_name(name))
+            path = next(filter(Path.exists, plan), None)
 
         if path:
             text = rtoml.load(path) if path.exists() else {}
             conf = cls.model_validate(text)
         else:
             conf = Conf()
-        conf.provider.key = os.getenv("OAI_API_KEY", conf.provider.key)
         return conf
+
+
+def _build_user_message(session: Session, conf: Conf, snap: TerminalSnapshot) -> str:
+    used = session.context_tokens
+    total = conf.provider.context_limit
+    context_tokens = "unknown" if used is None else f"{used}/{total}" if total else str(used)
+    return f"""\
+time: {datetime.now().isoformat(timespec="seconds")}
+context-tokens: {context_tokens}
+terminal-size: {snap.size}
+terminal-cursor: {snap.cursor}
+terminal-screen:
+{snap.screen}
+"""
 
 
 def main() -> None:
@@ -454,23 +479,23 @@ def main() -> None:
     history = Path(__file__).with_name(config.session)
     system = Path(__file__).with_name("SELF.md")
     system_fallback = (
-        "You are controlling the terminal via `input`. "
-        "Each round of user message is the terminal screen. "
-        "Do whatever you want! \n"
+        "I'm controlling the terminal via `input`. "
+        "Each round of user message is the terminal snapshot. "
+        "Do whatever I want! \n"
         "Now, this is the current terminal:"
     )
     prompt = system.read_text() if system.exists() else system_fallback
     session = Session.load(history) if history.exists() else Session.empty(prompt)
 
     # setup tools
-    tools = ToolContext(
+    tools = TerminalContext(
         name=config.terminal.session_name,
         pane=config.terminal.pane_id,
         timeout=config.terminal.command_timeout,
     )
 
     # setup client
-    client = OpenAI(api_key=config.provider.key, base_url=config.provider.url)
+    client = OpenAI(api_key=config.provider.key or None, base_url=config.provider.url)
 
     # start
     model = config.provider.model
@@ -478,13 +503,21 @@ def main() -> None:
         case []:
             match tools.snapshot():
                 case Ok(snap):
-                    content = _build_user_message(session, snap)
-                    chat(client, model, session, tools, content)
-                    _hr()
-                    session.save(history)
-                    total_messages = len(session.messages)
-                    total_tokens = session.context_tokens
-                    print(f"[SAVED] {history} ({total_messages} messages, {total_tokens} tokens)")
+                    content = _build_user_message(session, config, snap)
+                    try:
+                        chat(client, model, session, tools, content)
+                        save_sessions(session, history)
+                    except (
+                        AuthenticationError,
+                        BadRequestError,
+                        RateLimitError,
+                        APIConnectionError,
+                        InternalServerError,
+                        APIError,
+                    ) as e:
+                        print(f"[LLM ERROR] {e}")
+                        sys.exit(1)
+
                 case Error(error):
                     print(error)
                     sys.exit(1)

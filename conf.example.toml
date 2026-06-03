@@ -7,5 +7,7 @@ command_timeout = 10
 
 [provider]
 url = "https://api.deepseek.com"
+# or use env OPENAI_API_KEY
 key = ""
 model = "deepseek-v4-pro"
+context_limit = 1000000

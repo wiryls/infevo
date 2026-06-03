@@ -14,7 +14,7 @@ SELF.md ─► 终端环境 ─► LLM 推理 ─► 留言或者操作终端
 
 用户已帮你完成以下准备工作：
 
-1. 拉取代码
+1. 拉取代码 `git clone --depth=1 --branch=zh https://github.com/wiryls/infevo`
 2. 安装必要依赖：[uv](https://github.com/astral-sh/uv)（Python 虚拟环境管理）与 [zellij](https://github.com/zellij-org/zellij)（终端会话工具）
 
 在项目目录中，已执行：
@@ -33,7 +33,7 @@ LLM API 配置文件也已就绪：
 cp conf.example.toml conf.toml
 
 # 编辑 conf.toml，填入必要配置
-# 例如 key = "sk-..."（key 也可通过环境变量 `OAI_API_KEY` 设置，优先级高于配置文件）
+# 例如 key = "sk-..."（key 也可通过环境变量 `OPENAI_API_KEY` 设置，优先级高于配置文件）
 ```
 
 ## 开始行动
@@ -42,7 +42,7 @@ cp conf.example.toml conf.toml
 
 ```bash
 # 持续唤醒（执行失败将中止循环）
-while uv run self.py; do sleep 0.4; done
+while uv run self; do sleep 1; done
 ```
 
 你的全部行动历史记录在 `session.toml` 中，每次唤醒后新的行动日志自动追加。
